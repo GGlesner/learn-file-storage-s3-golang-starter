@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/rand"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"log"
@@ -40,7 +42,6 @@ func (cfg *apiConfig) handlerUploadThumbnail(w http.ResponseWriter, r *http.Requ
 
 	fmt.Println("uploading thumbnail for video", videoID, "by user", userID)
 
-	// TODO: implement the upload here
 	err = r.ParseMultipartForm(maxMemory)
 	if err != nil {
 		respondWithError(w, http.StatusBadRequest, "Couldn't parse multipart-form", err)
@@ -70,9 +71,12 @@ func (cfg *apiConfig) handlerUploadThumbnail(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	b := make([]byte, 32)
+	_, _ = rand.Read(b)
+	thumbnailID := base64.RawURLEncoding.EncodeToString(b)
 	thumbnailFilePath := filepath.Join(
 		cfg.assetsRoot,
-		fmt.Sprintf("%s.%s", videoID, parts[1]),
+		fmt.Sprintf("%s.%s", thumbnailID, parts[1]),
 	)
 	file, err := os.Create(thumbnailFilePath)
 	if err != nil {
