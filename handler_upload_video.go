@@ -1,13 +1,18 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"mime"
 	"net/http"
 	"os"
+	"os/exec"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -58,12 +63,13 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	}
 	ext := strings.Split(mediaType, "/")[1]
 
-	tmp, err := os.CreateTemp("/tmp/", "tubely-upload.mp4")
+	tmp, err := os.CreateTemp("/tmp/", `tubely-upload.mp4-*`)
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Couldn't create tmp file", err)
 		return
 	}
 	defer os.Remove(tmp.Name())
+	log.Println(tmp.Name())
 	defer tmp.Close()
 
 	reader := http.MaxBytesReader(w, f, 1<<30)
@@ -75,19 +81,28 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	prefix, err := getVideoAspectRatio(tmp.Name())
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, "Missing data on video's aspect ratio", err)
+		return
+	}
+
 	_, err = tmp.Seek(0, io.SeekStart)
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Couldn't rewind tmp file", err)
 		return
 	}
 
-	bucket := "tubely-3773"
 	b := make([]byte, 32)
 	_, _ = rand.Read(b)
-	videoKey := fmt.Sprintf("%s.%s", base64.RawURLEncoding.EncodeToString(b), ext)
+	videoKey := fmt.Sprintf("%s/%s.%s",
+		prefix,
+		base64.RawURLEncoding.EncodeToString(b),
+		ext,
+	)
 
 	_, err = cfg.s3Client.PutObject(r.Context(), &s3.PutObjectInput{
-		Bucket:      &bucket,
+		Bucket:      &cfg.s3Bucket,
 		Key:         &videoKey,
 		Body:        tmp,
 		ContentType: &mediaType,
@@ -108,5 +123,47 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Couldn't udpate video metadata", err)
 		return
+	}
+}
+
+func getVideoAspectRatio(filePath string) (string, error) {
+	cmd := exec.Command(
+		"ffprobe",
+		"-v", "error",
+		"-print_format", "json",
+		"-show_streams", filePath,
+	)
+	buf := bytes.NewBuffer(nil)
+	cmd.Stdout = buf
+	err := cmd.Run()
+	if err != nil {
+		return "", fmt.Errorf("couldn't run command: %v", err)
+	}
+
+	type outputFormat = struct {
+		Streams []struct {
+			DisplayAspectRatio *string `json:"display_aspect_ratio"`
+		}
+	}
+	var output outputFormat
+	err = json.Unmarshal(buf.Bytes(), &output)
+	if err != nil {
+		return "", fmt.Errorf("couldn't parse command's output: %v", err)
+	}
+	if len(output.Streams) == 0 {
+		return "", errors.New("empty command's output")
+	}
+
+	aspectRatio := output.Streams[0].DisplayAspectRatio
+	if aspectRatio == nil {
+		return "", errors.New("couldn't get aspect ratio from command's output")
+	}
+	switch *aspectRatio {
+	case "16:9":
+		return "landscape", nil
+	case "9:16":
+		return "portrait", nil
+	default:
+		return "other", nil
 	}
 }
