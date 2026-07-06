@@ -176,35 +176,24 @@ func generatePresignedURL(
 }
 
 func (cfg *apiConfig) dbVideoToSignedVideo(video database.Video) (database.Video, error) {
-	var v database.Video
-	v.CreateVideoParams = video.CreateVideoParams
-	v.CreatedAt = video.CreatedAt
-	v.Description = video.Description
-	v.ID = video.ID
-	v.ThumbnailURL = video.ThumbnailURL
-	v.Title = video.Title
-	v.UserID = video.UserID
-	v.UpdatedAt = video.UpdatedAt
-
 	if video.VideoURL == nil {
-		return v, nil
+		return video, nil
 	}
 
 	parts := strings.Split(*video.VideoURL, ",")
 	if len(parts) != 2 {
-		return v, fmt.Errorf("expected two comma separated values, got %v", nil)
+		return video, fmt.Errorf("expected two comma separated values, got %v", nil)
 	}
 
 	bucket := parts[0]
 	key := parts[1]
 	videoURL, err := generatePresignedURL(cfg.s3Client, bucket, key, 1*time.Minute)
 	if err != nil {
-		return v, fmt.Errorf("error generating presigned url: %v", err)
+		return video, fmt.Errorf("error generating presigned url: %v", err)
 	}
 
-	v.VideoURL = &videoURL
-
-	return v, nil
+	video.VideoURL = &videoURL
+	return video, nil
 }
 
 func getVideoAspectRatio(filePath string) (string, error) {

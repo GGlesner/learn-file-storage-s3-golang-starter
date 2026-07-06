@@ -122,13 +122,11 @@ func (cfg *apiConfig) handlerVideosRetrieve(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	if len(videos) > 0 {
-		for i, v := range videos {
-			videos[i], err = cfg.dbVideoToSignedVideo(v)
-			if err != nil {
-				respondWithError(w, http.StatusInternalServerError, "Couldn't convert video from db video", err)
-				return
-			}
+	for i, v := range videos {
+		videos[i], err = cfg.dbVideoToSignedVideo(v)
+		if err != nil {
+			respondWithError(w, http.StatusInternalServerError, "Couldn't convert video from db video", err)
+			return
 		}
 	}
 
