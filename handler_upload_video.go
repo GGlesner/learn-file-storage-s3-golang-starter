@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
@@ -14,9 +15,12 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/bootdotdev/learn-file-storage-s3-golang-starter/internal/auth"
+	"github.com/bootdotdev/learn-file-storage-s3-golang-starter/internal/database"
 	"github.com/google/uuid"
 )
 
@@ -56,6 +60,7 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	defer f.Close()
+
 	mediaType, _, err := mime.ParseMediaType(fh.Header.Get("Content-Type"))
 	if err != nil || mediaType != "video/mp4" {
 		respondWithError(w, http.StatusBadRequest, "Wrong mime type, expected video/mp4, got "+mediaType, err)
@@ -83,7 +88,7 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 
 	prefix, err := getVideoAspectRatio(tmp.Name())
 	if err != nil {
-		respondWithError(w, http.StatusBadRequest, "Missing data on video's aspect ratio", err)
+		respondWithError(w, http.StatusInternalServerError, "Missing data on video's aspect ratio", err)
 		return
 	}
 
@@ -98,12 +103,12 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		respondWithError(w, http.StatusInternalServerError, "Couldn't process video for faststart", err)
 		return
 	}
+	defer os.Remove(filePath)
 
 	processed, err := os.Open(filePath)
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Couldn't open processed video", err)
 	}
-	defer os.Remove(processed.Name())
 	defer processed.Close()
 
 	b := make([]byte, 32)
@@ -115,28 +120,91 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	)
 
 	_, err = cfg.s3Client.PutObject(r.Context(), &s3.PutObjectInput{
-		Bucket:      &cfg.s3Bucket,
-		Key:         &videoKey,
+		Bucket:      aws.String(cfg.s3Bucket),
+		Key:         aws.String(videoKey),
 		Body:        processed,
-		ContentType: &mediaType,
+		ContentType: aws.String(mediaType),
 	})
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Couldn't upload video to S3", err)
 		return
 	}
 
-	region := cfg.s3Client.Options().Region
-	videoURL := fmt.Sprintf("https://%s.s3.%s.amazonaws.com/%s",
-		"tubely-3773",
-		region,
-		videoKey,
-	)
+	// videoURL := fmt.Sprintf("https://%s.s3.%s.amazonaws.com/%s",
+	// 	"tubely-3773",
+	// 	cfg.s3Client.Options().Region,
+	// 	videoKey,
+	// )
+	videoURL := cfg.s3Bucket + "," + videoKey
 	video.VideoURL = &videoURL
 	err = cfg.db.UpdateVideo(video)
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Couldn't udpate video metadata", err)
 		return
 	}
+
+	v, err := cfg.dbVideoToSignedVideo(video)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Couldn't convert video from db video", err)
+		return
+	}
+
+	respondWithJSON(w, http.StatusOK, v)
+}
+
+func generatePresignedURL(
+	s3Client *s3.Client,
+	bucket string,
+	key string,
+	expireTime time.Duration,
+) (string, error) {
+	client := s3.NewPresignClient(s3Client)
+	req, err := client.PresignGetObject(
+		context.Background(), &s3.GetObjectInput{
+			Key:    &key,
+			Bucket: &bucket,
+		},
+		s3.WithPresignExpires(expireTime),
+	)
+	if err != nil {
+		return "", fmt.Errorf("couldn't presign url: %v", err)
+	}
+	if req == nil {
+		return "", errors.New("empty presigned request")
+	}
+	return req.URL, nil
+}
+
+func (cfg *apiConfig) dbVideoToSignedVideo(video database.Video) (database.Video, error) {
+	var v database.Video
+	v.CreateVideoParams = video.CreateVideoParams
+	v.CreatedAt = video.CreatedAt
+	v.Description = video.Description
+	v.ID = video.ID
+	v.ThumbnailURL = video.ThumbnailURL
+	v.Title = video.Title
+	v.UserID = video.UserID
+	v.UpdatedAt = video.UpdatedAt
+
+	if video.VideoURL == nil {
+		return v, nil
+	}
+
+	parts := strings.Split(*video.VideoURL, ",")
+	if len(parts) != 2 {
+		return v, fmt.Errorf("expected two comma separated values, got %v", nil)
+	}
+
+	bucket := parts[0]
+	key := parts[1]
+	videoURL, err := generatePresignedURL(cfg.s3Client, bucket, key, 1*time.Minute)
+	if err != nil {
+		return v, fmt.Errorf("error generating presigned url: %v", err)
+	}
+
+	v.VideoURL = &videoURL
+
+	return v, nil
 }
 
 func getVideoAspectRatio(filePath string) (string, error) {
@@ -153,12 +221,11 @@ func getVideoAspectRatio(filePath string) (string, error) {
 		return "", fmt.Errorf("couldn't run command: %v", err)
 	}
 
-	type outputFormat = struct {
+	var output struct {
 		Streams []struct {
 			DisplayAspectRatio *string `json:"display_aspect_ratio"`
-		}
+		} `json:"streams"`
 	}
-	var output outputFormat
 	err = json.Unmarshal(buf.Bytes(), &output)
 	if err != nil {
 		return "", fmt.Errorf("couldn't parse command's output: %v", err)
@@ -191,10 +258,19 @@ func processVideoForFastStart(filepath string) (string, error) {
 		"-f", "mp4",
 		fp,
 	)
-	cmd.Stdout = os.Stderr
+	buf := bytes.NewBuffer(nil)
+	cmd.Stdout = buf
 	err := cmd.Run()
 	if err != nil {
-		return "", fmt.Errorf("couldn't run command: %v", err)
+		return "", fmt.Errorf("couldn't run command: %s, %v", buf.String(), err)
+	}
+
+	fileInfo, err := os.Stat(fp)
+	if err != nil {
+		return "", fmt.Errorf("couldn't stat processed file: %v", err)
+	}
+	if fileInfo.Size() == 0 {
+		return "", errors.New("processed file is empty")
 	}
 
 	return fp, nil
