@@ -69,7 +69,7 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	defer os.Remove(tmp.Name())
-	log.Println(tmp.Name())
+	log.Println("created tmp file: ", tmp.Name())
 	defer tmp.Close()
 
 	reader := http.MaxBytesReader(w, f, 1<<30)
@@ -87,11 +87,24 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	_, err = tmp.Seek(0, io.SeekStart)
+	// _, err = tmp.Seek(0, io.SeekStart)
+	// if err != nil {
+	// 	respondWithError(w, http.StatusInternalServerError, "Couldn't rewind tmp file", err)
+	// 	return
+	// }
+
+	filePath, err := processVideoForFastStart(tmp.Name())
 	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, "Couldn't rewind tmp file", err)
+		respondWithError(w, http.StatusInternalServerError, "Couldn't process video for faststart", err)
 		return
 	}
+
+	processed, err := os.Open(filePath)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Couldn't open processed video", err)
+	}
+	defer os.Remove(processed.Name())
+	defer processed.Close()
 
 	b := make([]byte, 32)
 	_, _ = rand.Read(b)
@@ -104,7 +117,7 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	_, err = cfg.s3Client.PutObject(r.Context(), &s3.PutObjectInput{
 		Bucket:      &cfg.s3Bucket,
 		Key:         &videoKey,
-		Body:        tmp,
+		Body:        processed,
 		ContentType: &mediaType,
 	})
 	if err != nil {
@@ -166,4 +179,23 @@ func getVideoAspectRatio(filePath string) (string, error) {
 	default:
 		return "other", nil
 	}
+}
+
+func processVideoForFastStart(filepath string) (string, error) {
+	fp := filepath + ".processing"
+	cmd := exec.Command(
+		"ffmpeg",
+		"-i", filepath,
+		"-c", "copy",
+		"-movflags", "faststart",
+		"-f", "mp4",
+		fp,
+	)
+	cmd.Stdout = os.Stderr
+	err := cmd.Run()
+	if err != nil {
+		return "", fmt.Errorf("couldn't run command: %v", err)
+	}
+
+	return fp, nil
 }
